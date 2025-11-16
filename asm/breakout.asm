@@ -114,15 +114,24 @@ temp2           = $11
 temp3           = $12
 temp4           = $13
 
-brick_x         = $14
-brick_y         = $15
-brick_idx       = $16
-check_x         = $17
-check_y         = $18
+brick_idx       = $14
+temp_ptr_lo     = $15
+temp_ptr_hi     = $16
+
+; Brick structure offsets (4 bytes per brick)
+BRICK_X         = 0
+BRICK_Y         = 1
+BRICK_COLOR     = 2
+BRICK_ACTIVE    = 3
+BRICK_SIZE      = 4      ; Total bytes per brick
 
 ; Brick array - 48 bricks (6 rows × 8 columns)
-; Each brick: 0 = destroyed, 1-7 = color/active
-bricks          = $0100  ; 48 bytes at $0100-$012F
+; Each brick is a 4-byte structure:
+;   +0: X position
+;   +1: Y position
+;   +2: Color/type (1-6)
+;   +3: Active flag (0 = destroyed, 1 = active)
+bricks          = $0100  ; 192 bytes at $0100-$01BF (48 × 4 bytes)
 
 ; ====================================================================
 ; RESET - Program entry point
@@ -225,31 +234,98 @@ InitGame:
     RTS
 
 ; ====================================================================
-; INIT BRICKS - Set up the brick array
+; INIT BRICKS - Set up the brick array with struct data
 ; ====================================================================
 InitBricks:
-    LDX #0
     LDA #0
     STA bricks_left
+    STA brick_idx       ; brick_idx = logical brick number (0-47)
 
 InitBricksLoop:
     ; Calculate row (brick_idx / 8)
-    TXA
-    AND #$F8            ; Mask to get row start
+    LDA brick_idx
     LSR
     LSR
-    LSR                 ; Divide by 8
+    LSR                 ; A = row (0-5)
+    STA temp1
 
-    ; Color based on row: 1=Red, 2=Orange, 3=Yellow, 4=Green, 5=Cyan, 6=Blue
+    ; Calculate column (brick_idx & 7)
+    LDA brick_idx
+    AND #$07            ; A = column (0-7)
+    STA temp2
+
+    ; Calculate X position: column * BRICK_SPACING_X + BRICK_START_X
+    ASL                 ; * 2
+    ASL                 ; * 4
+    ASL                 ; * 8
+    ASL                 ; * 16
+    CLC
+    ADC #BRICK_START_X
+    STA temp3           ; temp3 = X position
+
+    ; Calculate Y position: row * BRICK_SPACING_Y + BRICK_START_Y
+    LDA temp1           ; row
+    STA temp4
+    ASL                 ; * 2
+    ADC temp4           ; * 3
+    ASL                 ; * 6
+    ADC temp4           ; * 7
+    CLC
+    ADC #BRICK_START_Y  ; temp4 = Y position
+    STA temp4
+
+    ; Calculate color based on row: 1=Red, 2=Orange, 3=Yellow, 4=Green, 5=Cyan, 6=Blue
+    LDA temp1           ; row
+    CLC
+    ADC #1              ; color = row + 1
+
+    ; Now store all fields in the brick structure
+    ; Calculate base address: bricks + (brick_idx * 4)
+    ; We'll use temp_ptr as a pointer
+    LDX brick_idx
+    LDA #0
+    STA temp_ptr_hi
+    TXA
+    ASL                 ; * 2
+    ROL temp_ptr_hi
+    ASL                 ; * 4
+    ROL temp_ptr_hi
+    CLC
+    ADC #<bricks
+    STA temp_ptr_lo
+    LDA temp_ptr_hi
+    ADC #>bricks
+    STA temp_ptr_hi
+
+    ; Store X position (offset 0)
+    LDY #BRICK_X
+    LDA temp3
+    STA (temp_ptr_lo),Y
+
+    ; Store Y position (offset 1)
+    LDY #BRICK_Y
+    LDA temp4
+    STA (temp_ptr_lo),Y
+
+    ; Store color (offset 2)
+    LDY #BRICK_COLOR
+    LDA temp1           ; row
     CLC
     ADC #1
-    STA bricks,X
+    STA (temp_ptr_lo),Y
+
+    ; Store active flag (offset 3)
+    LDY #BRICK_ACTIVE
+    LDA #1              ; 1 = active
+    STA (temp_ptr_lo),Y
 
     ; Increment brick count
     INC bricks_left
 
-    INX
-    CPX #(BRICK_ROWS * BRICK_COLS)
+    ; Next brick
+    INC brick_idx
+    LDA brick_idx
+    CMP #(BRICK_ROWS * BRICK_COLS)
     BNE InitBricksLoop
 
     RTS
@@ -485,46 +561,47 @@ CheckBrickCollision:
     BCS BallUpdateDone
 
     ; Check all bricks
-    LDX #0
+    LDA #0
+    STA brick_idx
 BrickCheckLoop:
-    ; Skip destroyed bricks
-    LDA bricks,X
+    ; Load brick data
+    JSR GetBrickData
+
+    ; Skip destroyed bricks (temp4 = active flag)
+    LDA temp4
     BEQ NextBrick
 
-    ; Calculate brick position
-    STX brick_idx
-    JSR GetBrickPosition
-
-    ; Check X overlap
+    ; Check X overlap (temp1 = brick X)
     LDA ball_x
     CLC
     ADC #BALL_SIZE
-    CMP brick_x
+    CMP temp1
     BCC NextBrick       ; Ball right < brick left
 
-    LDA brick_x
+    LDA temp1
     CLC
     ADC #BRICK_WIDTH
     CMP ball_x
     BCC NextBrick       ; Brick right < ball left
 
-    ; Check Y overlap
+    ; Check Y overlap (temp2 = brick Y)
     LDA ball_y
     CLC
     ADC #BALL_SIZE
-    CMP brick_y
+    CMP temp2
     BCC NextBrick       ; Ball bottom < brick top
 
-    LDA brick_y
+    LDA temp2
     CLC
     ADC #BRICK_HEIGHT
     CMP ball_y
     BCC NextBrick       ; Brick bottom < ball top
 
     ; Collision detected!
-    LDX brick_idx
+    ; Destroy brick by setting active flag to 0
+    LDY #BRICK_ACTIVE
     LDA #0
-    STA bricks,X        ; Destroy brick
+    STA (temp_ptr_lo),Y
 
     ; Reverse ball Y velocity
     LDA ball_vy
@@ -545,51 +622,59 @@ ScoreOK:
     JMP BallUpdateDone  ; Only hit one brick per frame
 
 NextBrick:
-    LDX brick_idx
-    INX
-    CPX #(BRICK_ROWS * BRICK_COLS)
+    INC brick_idx
+    LDA brick_idx
+    CMP #(BRICK_ROWS * BRICK_COLS)
     BNE BrickCheckLoop
 
 BallUpdateDone:
     RTS
 
 ; ====================================================================
-; GET BRICK POSITION - Calculate X,Y from brick index
-; Input: brick_idx = brick array index
-; Output: brick_x, brick_y
+; GET BRICK DATA - Load brick struct data from array
+; Input: brick_idx = brick array index (0-47)
+; Output: temp_ptr_lo/hi = pointer to brick struct
+;         temp1 = X position
+;         temp2 = Y position
+;         temp3 = Color
+;         temp4 = Active flag
 ; ====================================================================
-GetBrickPosition:
-    ; Get row (index / 8)
-    LDA brick_idx
-    LSR
-    LSR
-    LSR                 ; Divide by 8
-    STA temp1           ; temp1 = row
-
-    ; Calculate Y position
-    LDA temp1
-    STA temp2
+GetBrickData:
+    ; Calculate base address: bricks + (brick_idx * 4)
+    LDX brick_idx
+    LDA #0
+    STA temp_ptr_hi
+    TXA
     ASL                 ; * 2
-    ADC temp2           ; * 3
-    ASL                 ; * 6
-    ADC temp2           ; * 7 (BRICK_SPACING_Y)
-    CLC
-    ADC #BRICK_START_Y
-    STA brick_y
-
-    ; Get column (index & 7)
-    LDA brick_idx
-    AND #$07
-    STA temp1           ; temp1 = column
-
-    ; Calculate X position (column * BRICK_SPACING_X + BRICK_START_X)
-    ASL                 ; * 2
+    ROL temp_ptr_hi
     ASL                 ; * 4
-    ASL                 ; * 8
-    ASL                 ; * 16
+    ROL temp_ptr_hi
     CLC
-    ADC #BRICK_START_X
-    STA brick_x
+    ADC #<bricks
+    STA temp_ptr_lo
+    LDA temp_ptr_hi
+    ADC #>bricks
+    STA temp_ptr_hi
+
+    ; Load X position
+    LDY #BRICK_X
+    LDA (temp_ptr_lo),Y
+    STA temp1
+
+    ; Load Y position
+    LDY #BRICK_Y
+    LDA (temp_ptr_lo),Y
+    STA temp2
+
+    ; Load color
+    LDY #BRICK_COLOR
+    LDA (temp_ptr_lo),Y
+    STA temp3
+
+    ; Load active flag
+    LDY #BRICK_ACTIVE
+    LDA (temp_ptr_lo),Y
+    STA temp4
 
     RTS
 
@@ -615,23 +700,22 @@ DrawGame:
 ; DRAW BRICKS - Draw all active bricks
 ; ====================================================================
 DrawBricks:
-    LDX #0
+    LDA #0
+    STA brick_idx
 DrawBricksLoop:
-    ; Check if brick is active
-    LDA bricks,X
+    ; Load brick data
+    JSR GetBrickData
+
+    ; Check if brick is active (temp4 = active flag)
+    LDA temp4
     BEQ SkipBrick
 
-    ; Save brick index
-    STX brick_idx
+    ; temp1 = X position
+    ; temp2 = Y position
+    ; temp3 = color value (1-6)
 
-    ; Get brick position
-    JSR GetBrickPosition
-
-    ; Get brick color based on row
-    LDX brick_idx
-    LDA bricks,X
-
-    ; Map brick value to color
+    ; Map brick color value to actual color
+    LDA temp3
     CMP #1
     BNE TryOrange
     LDA #(HUE_RED | SAT_FULL | 4)
@@ -665,16 +749,16 @@ TryBlue:
     LDA #(HUE_BLUE | SAT_FULL | 4)
 
 DrawThisBrick:
-    STA temp1
+    PHA                 ; Save color
 
     ; Set up colored rectangle
     LDA dma_mirror
     ORA #COLORFILL
     STA DMA_Flags
 
-    LDA brick_x
+    LDA temp1           ; X position
     STA DMA_VX
-    LDA brick_y
+    LDA temp2           ; Y position
     STA DMA_VY
 
     LDA #BRICK_WIDTH
@@ -682,7 +766,7 @@ DrawThisBrick:
     LDA #BRICK_HEIGHT
     STA DMA_HEIGHT
 
-    LDA temp1
+    PLA                 ; Restore color
     EOR #$FF            ; Invert color for DMA
     STA DMA_Color
 
@@ -691,9 +775,9 @@ DrawThisBrick:
     WAI                 ; Wait for blit to complete
 
 SkipBrick:
-    LDX brick_idx
-    INX
-    CPX #(BRICK_ROWS * BRICK_COLS)
+    INC brick_idx
+    LDA brick_idx
+    CMP #(BRICK_ROWS * BRICK_COLS)
     BNE DrawBricksLoop
 
     RTS
